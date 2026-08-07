@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import textwrap
 import time
 from pathlib import Path
 
@@ -76,6 +77,17 @@ def section(title: str) -> None:
 
 def money(value: float) -> str:
     return f"${value:,.2f}"
+
+
+# Kept narrow on purpose: the demo is meant to be screen-recorded at a
+# large font, and anything past ~90 columns wraps badly in a GIF.
+WRAP_WIDTH = 88
+
+
+def wrapped(text: str, indent: str = "  ") -> str:
+    return textwrap.fill(
+        text, width=WRAP_WIDTH, initial_indent=indent, subsequent_indent=indent
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +155,8 @@ def demo_redaction(audit_log: AuditLog) -> None:
     def send_notification(message: str) -> str:
         # This is the tool itself. Whatever it prints is what actually
         # arrived - not a sanitized copy made for the log.
-        print(f"  function received: {message}")
+        print("  function received:")
+        print(wrapped(message, indent="    "))
         return message
 
     raw = (
@@ -152,7 +165,8 @@ def demo_redaction(audit_log: AuditLog) -> None:
     )
 
     print("  agent tried to send:")
-    print(f"  {raw}\n")
+    print(wrapped(raw, indent="    "))
+    print()
     send_notification(raw)
     print("\n  The email and the API key never left the process.")
 
@@ -166,7 +180,9 @@ def demo_audit(audit_log: AuditLog) -> None:
     section("AUDIT TRAIL")
 
     entries = audit_log.tail(5)
-    print(f"  last {len(entries)} entries from {audit_log.path}\n")
+    # Only the filename: the full temp path is long, machine-specific,
+    # and ends up on screen in any recording of this demo.
+    print(f"  last {len(entries)} entries from {audit_log.path.name}\n")
 
     for entry in entries:
         # ALLOW entries have no rule - nothing fired, which is the point.
