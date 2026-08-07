@@ -3,6 +3,8 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 
+![guardrail-core demo](assets/demo.gif)
+
 Policy enforcement for AI agent tool-calls. Intercept a call **before** it
 executes, enforce **spend caps**, **rate limits** and **PII/secret rules**
 against a declarative policy, and append every decision to an

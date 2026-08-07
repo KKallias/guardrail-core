@@ -16,7 +16,7 @@ Output assets/demo-post.gif
 # prompts, at a font big enough to read on a phone in a feed.
 Set Shell "bash"
 Set FontSize 22
-Set Width 1330
+Set Width 1450
 Set Height 1450
 Set Padding 30
 Set Theme "Catppuccin Mocha"
