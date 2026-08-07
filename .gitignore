@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Audit logs are runtime data, never committed - they can contain
+# redacted-but-still-sensitive metadata about real agent activity.
+# The example demos write theirs to the system temp dir, outside the
+# repo; these patterns cover any log written locally instead.
+logs/
+*.jsonl
+guardrail-unified-demo.jsonl
+guardrail-demo-audit.jsonl
+!tests/**/*.jsonl
+
+.env
+.DS_Store

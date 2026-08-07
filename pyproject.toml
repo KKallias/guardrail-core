@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "guardrail-core"
+version = "0.1.0"
+description = "Policy enforcement for AI agent tool-calls: spend caps, rate limits, PII/secret detection, and an append-only audit log."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Konstantinos Kallias" }]
+keywords = ["ai", "agents", "guardrails", "policy", "audit", "pii", "x402", "mpp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = ["pyyaml>=6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+# The LangChain adapter degrades gracefully when LangChain is absent, so
+# it is opt-in rather than a hard dependency.
+langchain = ["langchain-core>=0.3"]
+
+[project.scripts]
+guardrail = "guardrail_core.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/KKallias/guardrail-core"
+Issues = "https://github.com/KKallias/guardrail-core/issues"
+
+[tool.setuptools.packages.find]
+include = ["guardrail_core*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

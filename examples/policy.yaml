@@ -1,0 +1,37 @@
+# Example guardrail-core policy.
+#
+#   guardrail policy --policy examples/policy.yaml        # validate
+#   guardrail check  --policy examples/policy.yaml \
+#                    --tool search --amount 0.25 --payload '{"q": "hi"}'
+
+name: default
+
+# Optional. Restricts who a call may be directed at (ToolCall.recipient:
+# an MPP account id, an x402 payTo address, an API vendor). Calls with no
+# recipient skip this rule; an empty list means "no restriction".
+# allowlist:
+#   recipients:
+#     - acct_trusted
+
+spend_cap:
+  # Largest single charge allowed.
+  per_call: 1.00
+  # Rolling-window total: at most $5 in any 1-hour window.
+  window_amount: 5.00
+  window_seconds: 3600
+  currency: USD
+
+rate_limit:
+  max_calls: 10
+  window_seconds: 60
+
+pii_rules:
+  detectors:
+    - email
+    - api_key
+    - crypto_wallet
+    - card_number
+  # redact = strip matches and let the call through
+  # block  = refuse the call
+  action: redact
+  # fields: [query]     # optional: scan only these top-level payload keys
