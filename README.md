@@ -224,6 +224,33 @@ function. `redact_as_block=False` is available for that setup — handler for
 audit and spend/rate enforcement, decorator for redaction — but on its own it
 means the tool receives the **original, unredacted** input.
 
+**`mcp`** — a proxy-side guard for Model Context Protocol `tools/call`:
+
+```python
+from guardrail_core.adapters.mcp import MCPGuard
+
+guard = MCPGuard(policy, server="files-server")
+
+def handle(request):
+    decision = guard.inspect(request)
+    if decision.response is not None:
+        return decision.response            # refused, upstream never contacted
+    return upstream.send(decision.request)  # forwarded, possibly redacted
+```
+
+This is the one adapter where `REDACT` works properly. A proxy sits in the
+middle of the JSON-RPC stream and can rewrite `params.arguments` before
+forwarding, so the upstream server receives the redacted values and the call
+still succeeds — the thing a LangChain callback structurally cannot do.
+
+Blocked calls come back as a tool result with `isError: true`, not a JSON-RPC
+protocol error: a policy refusal is something the *model* should read and
+adapt to, while a protocol error makes the client think the server is broken.
+`server=` sets the call's recipient, so `allowlist.recipients` restricts which
+upstream servers are reachable. Non-tool traffic (`initialize`, `tools/list`)
+passes through unevaluated and unlogged. Plain dicts throughout — no MCP SDK
+dependency.
+
 **`x402` / `mpp`** — scaffolding, not yet wired into the two existing repos.
 `X402Adapter` maps an endpoint + USDC amount to a `ToolCall` and keeps the
 testnet-only settlement guard; `MppAdapter` maps an MPP Challenge, converting
@@ -292,7 +319,7 @@ succeed, the fifth is blocked, then the audit log is printed.
 python -m pytest
 ```
 
-116 tests, no network access, no live services — allowlist blocks, spend-cap
+134 tests, no network access, no live services — allowlist blocks, spend-cap
 blocks, rate-limit blocks, PII redaction, allowed pass-through, adapter
 behaviour, audit-log durability, and CLI exit codes.
 
