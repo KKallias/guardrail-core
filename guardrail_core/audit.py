@@ -30,8 +30,11 @@ DEFAULT_AUDIT_PATH = Path("logs") / "guardrail-audit.jsonl"
 SCHEMA_VERSION = 1
 
 # Decision value for a reconciliation entry - a record of what actually
-# happened, written after the fact. It is not a verdict from `Guard.check`,
-# so it must never be replayed as spend or rate-limit history; see
+# happened, written after the fact by `Guard.reconcile`. Deliberately not
+# a member of `guard.Decision`: that enum is the set of verdicts
+# `Guard.check` can return, and a reconciliation is not a verdict. It
+# therefore appears only in the log, never on a `GuardResult`, and must
+# never be replayed as spend or rate-limit history - see
 # `Guard.REPLAYED_DECISIONS`.
 RECONCILE = "RECONCILE"
 

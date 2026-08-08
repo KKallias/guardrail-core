@@ -128,7 +128,10 @@ def cmd_audit(args: argparse.Namespace) -> int:
         if not entries:
             print(f"no entries in {log.path}")
 
-    total = sum(e.amount or 0 for e in entries if e.decision != Decision.BLOCK.value)
+    # Only decisions that actually consumed budget count toward the total.
+    # A BLOCK spent nothing, and a RECONCILE restates a call already
+    # counted from its ALLOW - summing it would double the reported spend.
+    total = sum(e.amount or 0 for e in entries if e.decision in Guard.REPLAYED_DECISIONS)
     if args.summary:
         blocked = sum(1 for e in entries if e.decision == Decision.BLOCK.value)
         print(f"\n{len(entries)} entries, {blocked} blocked, {total:.4f} spent")
@@ -182,7 +185,11 @@ def build_parser() -> argparse.ArgumentParser:
     audit = sub.add_parser("audit", help="read the audit log")
     audit.add_argument("--log", default=None, help="audit log path")
     audit.add_argument("--tail", type=int, default=None)
-    audit.add_argument("--decision", default=None, help="filter: allow | block | redact")
+    audit.add_argument(
+        "--decision",
+        default=None,
+        help="filter: allow | block | redact | reconcile (case-insensitive)",
+    )
     audit.add_argument("--summary", action="store_true")
     audit.add_argument("--json", action="store_true")
     audit.set_defaults(func=cmd_audit)

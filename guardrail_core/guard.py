@@ -164,11 +164,19 @@ class GuardResult:
 
     @property
     def allowed(self) -> bool:
-        """True for ALLOW and REDACT - i.e. the call may proceed."""
+        """True for ALLOW and REDACT - i.e. the call may proceed.
+
+        Only ALLOW, BLOCK and REDACT can ever reach here: RECONCILE is an
+        audit-log decision type written after the fact and never appears
+        on a `GuardResult`, so branching on this stays exhaustive. To
+        find reconciliation outcomes, read the audit log and check
+        `rule` for `reconcile.match` / `reconcile.mismatch`.
+        """
         return self.decision is not Decision.BLOCK
 
     @property
     def blocked(self) -> bool:
+        """True for BLOCK only - see `allowed` on why RECONCILE is absent."""
         return self.decision is Decision.BLOCK
 
     @property

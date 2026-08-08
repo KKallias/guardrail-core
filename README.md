@@ -87,6 +87,33 @@ is a more useful reason than "this call is too expensive".
 
 Every check writes exactly one audit entry, including allowed ones.
 
+### Decision types
+
+`Guard.check` returns one of three verdicts. A fourth value appears in the
+audit log only:
+
+| decision | returned by `check()`? | meaning |
+| --- | --- | --- |
+| `ALLOW` | yes | no rule fired; the call proceeds unchanged |
+| `REDACT` | yes | a detector matched; the call proceeds with a rewritten payload |
+| `BLOCK` | yes | a rule refused the call; it must not run |
+| `RECONCILE` | **no** | a record of what actually happened, written after the fact |
+
+`RECONCILE` entries are written by `Guard.reconcile()` — called by adapters
+after an operation completes, currently only `X402Adapter.record_settlement`
+— never by `check()`. They carry one of two rules:
+
+| rule | meaning |
+| --- | --- |
+| `reconcile.match` | the actual outcome matches the decision it is reconciled against |
+| `reconcile.mismatch` | recipient, amount or currency diverged, or the adapter reported failure via `ok=False` |
+
+Because `RECONCILE` never reaches a `GuardResult`, branching on
+`result.allowed` / `result.blocked` stays exhaustive — there is no fourth
+case to handle. It is also excluded from spend and rate-limit replay, so a
+reconciliation never moves a budget or inflates a reported total. See
+[Threat Model](#threat-model) for what reconciliation does and does not buy.
+
 ### Spend and rate state survives restarts
 
 A fresh `Guard` rebuilds its rolling windows from the audit log. An agent
@@ -255,9 +282,32 @@ or truncates an existing line.
  "policy": "demo-agent", "rule": "spend_cap.window", "amount": 1.25, "currency": "USD"}
 ```
 
+A reconciliation entry, written after the fact, points back at the decision
+it reconciles rather than describing a new one:
+
+```json
+{"v": 1, "timestamp": "2026-08-07T14:05:17.031204+00:00", "call_id": "2df69f16690e",
+ "tool": "x402:/weather", "decision": "RECONCILE",
+ "reason": "reconciliation mismatch - recipient: decided '0x8f2a…', actual '0xd1c4…'",
+ "rule": "reconcile.mismatch", "amount": 0.01, "currency": "USDC",
+ "recipient": "0xd1c4…", "digest": "9c1f…",
+ "metadata": {"reconciles": "2df69f16690e", "original_decision": "ALLOW"}}
+```
+
+The `digest` is the *original* decision's, and `metadata.reconciles` carries
+the `call_id` it refers to, so the pair can be joined when reading the log
+back. Read them with `guardrail audit --decision reconcile`.
+
 Raw payloads are never written — only the redacted version, when redaction
 fired. Corrupted lines (a process killed mid-write) are skipped on read
 rather than making the whole history unreadable.
+
+**Schema note.** `v: 1` gained the `RECONCILE` decision type, plus the
+`recipient` and `digest` fields, after the initial commit — see
+[`75ed261`](https://github.com/KKallias/guardrail-core/commit/75ed261). The
+version was not bumped: the repo was a day old with no external consumers,
+and every change was additive (readers of older lines see the same fields
+they always did). Recorded here for anyone reading the git history later.
 
 ## Adapters
 
@@ -393,7 +443,7 @@ succeed, the fifth is blocked, then the audit log is printed.
 python -m pytest
 ```
 
-161 tests, no network access, no live services — allowlist blocks, spend-cap
+163 tests, no network access, no live services — allowlist blocks, spend-cap
 blocks, rate-limit blocks, PII redaction, allowed pass-through, adapter
 behaviour, audit-log durability, and CLI exit codes.
 

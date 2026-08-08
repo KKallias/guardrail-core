@@ -120,6 +120,41 @@ def test_audit_filter_by_decision(policy_file, tmp_path, capsys):
     assert entries[0]["tool"] == "b"
 
 
+def test_audit_filter_accepts_reconcile(policy_file, tmp_path, capsys):
+    log_path = tmp_path / "audit.jsonl"
+    _reconciled_log(log_path)
+    capsys.readouterr()
+
+    main(["audit", "--log", str(log_path), "--decision", "reconcile", "--json"])
+    entries = json.loads(capsys.readouterr().out)
+
+    assert len(entries) == 1
+    assert entries[0]["decision"] == "RECONCILE"
+
+
+def test_audit_summary_does_not_double_count_reconciliations(tmp_path, capsys):
+    """A RECONCILE restates a call already counted from its ALLOW."""
+    log_path = tmp_path / "audit.jsonl"
+    _reconciled_log(log_path)
+    capsys.readouterr()
+
+    main(["audit", "--log", str(log_path), "--summary"])
+    out = capsys.readouterr().out
+
+    assert "2 entries, 0 blocked, 2.5000 spent" in out
+
+
+def _reconciled_log(log_path):
+    """One allowed 2.50 call plus its reconciliation."""
+    from guardrail_core import Guard, Policy, ToolCall
+    from guardrail_core.audit import AuditLog
+
+    log = AuditLog(log_path)
+    guard = Guard(Policy(name="t"), log)
+    result = guard.check(ToolCall(tool="pay", amount=2.50, recipient="acct_a"))
+    guard.reconcile(result.call.call_id, {"recipient": "acct_a", "amount": 2.50})
+
+
 def test_policy_command_validates(policy_file, capsys):
     assert main(["policy", "--policy", policy_file]) == EXIT_OK
     assert "cli-demo" in capsys.readouterr().out
