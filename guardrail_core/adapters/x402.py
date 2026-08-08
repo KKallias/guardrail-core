@@ -44,8 +44,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..audit import AuditEntry, AuditLog, utcnow
-from ..guard import Decision, Guard, GuardResult, ToolCall
+from ..audit import AuditLog
+from ..guard import Guard, GuardResult, ToolCall
 from ..policy import Policy
 
 __all__ = ["X402Adapter", "ALLOWED_TESTNET_NETWORKS"]
@@ -162,28 +162,34 @@ class X402Adapter:
         self,
         result: GuardResult,
         settle_response: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Append the on-chain outcome of an approved payment to the audit log."""
+    ) -> None:
+        """Append the on-chain outcome of an approved payment to the audit log.
+
+        Delegates to the protocol-agnostic `Guard.reconcile`, so an x402
+        settlement lands in the same reconciliation format as any other
+        adapter's after-the-fact record.
+
+        Note what x402 cannot reconcile: the settlement response carries
+        `payer` (the sender) but no `payTo`, so there is nothing in it to
+        compare against the recipient the decision approved. A settlement
+        that landed at a different address than the one allowlisted would
+        not be visible here. What is checked is the network and the
+        success flag.
+        """
         ok, reason = self.check_settlement(settle_response)
-        entry = AuditEntry(
-            timestamp=utcnow(),
-            call_id=result.call.call_id,
-            tool=result.call.tool,
-            decision=Decision.ALLOW.value if ok else Decision.BLOCK.value,
-            reason=f"settlement: {reason}",
-            policy=result.policy,
-            rule="x402.settlement",
-            amount=result.call.amount,
-            currency=result.call.currency,
-            recipient=result.call.recipient,
-            metadata={
+        self.guard.reconcile(
+            result.call.call_id,
+            {
+                "ok": ok,
+                "reason": f"settlement: {reason}",
                 "protocol": "x402",
                 "network": settle_response.get("network"),
                 "tx_hash": settle_response.get("transaction"),
                 # The sender (our own wallet), not the recipient - see the
-                # module docstring on why these must not be conflated.
+                # module docstring on why these must not be conflated. It
+                # is deliberately not passed as `recipient`.
                 "payer": settle_response.get("payer"),
                 "success": settle_response.get("success"),
+                "settlement_ok": ok,
             },
         )
-        return self.guard.audit_log.append(entry)

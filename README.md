@@ -104,6 +104,80 @@ yourself once the call really happens.
 Blocked calls consume nothing — a refused call neither spent money nor used
 rate-limit budget.
 
+## Threat Model
+
+**guardrail-core is a policy layer for cooperative call sites. It is not a
+security boundary against a compromised agent.**
+
+It enforces policy at whichever call site a developer routes through it. It
+does not hold, proxy, or gate the underlying credential — the API key, the
+wallet private key, the session token. That credential stays wherever your
+process already keeps it, fully usable by any code in that process.
+
+So the bypass is trivial and worth stating plainly: an agent that can reach
+the credential by a second path — a direct `httpx` call, a shell out to
+`curl`, a library that reads the key from the environment itself, code the
+model wrote and executed — simply does not go through the guard, and no cap,
+allowlist or detector applies. A `$5` spend cap constrains the calls you
+routed through `Guard.check`. It does not constrain the wallet.
+
+This is the right tool when the agent is buggy, over-eager, badly prompted,
+or working from untrusted input, and the call sites are ones you control. It
+is the wrong tool if your threat model includes an agent process actively
+trying to evade its own limits.
+
+### What narrows the gap, and what doesn't
+
+Two features make a bypass *detectable*. Neither makes one *impossible* —
+that distinction is the whole point of this section.
+
+**Decision digest.** Every ALLOW/REDACT result carries a `digest`: a sha256
+over the operation that was approved (tool, recipient, amount, currency,
+call_id, timestamp — not the payload, which redaction rewrites). Right before
+executing, a caller can confirm the operation still matches:
+
+```python
+result = guard.check(call)
+if not result.matches(call):        # amount recomputed? recipient re-resolved?
+    raise RuntimeError("call drifted between the decision and execution")
+```
+
+This catches drift between `check()` and execution — a retry that rebuilt the
+call, a price re-resolved, a recipient looked up again. It catches accidents.
+Code that can change the operation can also skip the check.
+
+**Reconciliation.** `Guard.reconcile(call_id, actual)` looks up the original
+decision and appends a follow-up entry recording what actually happened,
+flagging any divergence in recipient, amount, or currency:
+
+```python
+guard.reconcile(result.call.call_id, {"recipient": paid_to, "amount": charged})
+```
+
+The original line is never edited — reconciliation is always a new entry, and
+reconciliation entries are excluded from spend and rate-limit replay so
+recording one never moves a budget. An unknown `call_id` raises
+`UnknownCallId` rather than accepting a record for a call the guard never saw.
+
+What this buys: if money moved to an address the policy never approved, the
+log says so afterwards, with both values side by side. What it does not buy:
+the money already moved. Reconciliation is an alarm, not a lock — and it only
+fires if something calls it, which a bypassing path also won't.
+
+### v2 direction
+
+The stronger guarantee is a gateway model: credentials held *behind* the
+enforcement point, so the agent never possesses them and a request that
+doesn't pass policy has nothing to send. Virtual keys, scoped and revocable,
+issued per agent.
+
+That is a deliberate future direction and is **not built**. It is also not
+merely more code — it changes the product into a credential-custody service.
+Holding other people's API keys and wallet keys carries regulatory and
+liability weight that a policy SDK does not, particularly once payment
+credentials are involved. That is a decision to make deliberately, not to
+drift into.
+
 ## Policy
 
 ```yaml
@@ -319,7 +393,7 @@ succeed, the fifth is blocked, then the audit log is printed.
 python -m pytest
 ```
 
-134 tests, no network access, no live services — allowlist blocks, spend-cap
+161 tests, no network access, no live services — allowlist blocks, spend-cap
 blocks, rate-limit blocks, PII redaction, allowed pass-through, adapter
 behaviour, audit-log durability, and CLI exit codes.
 

@@ -17,7 +17,7 @@ from guardrail_core.adapters.generic import guarded
 from guardrail_core.adapters.langchain import GuardrailCallbackHandler
 from guardrail_core.adapters.mpp import MppAdapter
 from guardrail_core.adapters.x402 import X402Adapter
-from guardrail_core.audit import AuditLog
+from guardrail_core.audit import RECONCILE, AuditLog
 from guardrail_core.policy import Allowlist, PiiRules, RateLimit, SpendCap
 
 
@@ -378,7 +378,8 @@ def test_x402_payer_is_not_treated_as_the_recipient(log):
     last = log.read_all()[-1]
     assert last.recipient == SERVER
     assert last.metadata["payer"] != last.recipient
-    assert last.decision == Decision.ALLOW.value
+    assert last.decision == RECONCILE
+    assert last.rule == "reconcile.match"
 
 
 def test_x402_adapter_rejects_non_testnet_settlement(log):
@@ -407,9 +408,45 @@ def test_x402_adapter_accepts_testnet_settlement_and_logs_it(log):
     )
 
     last = log.read_all()[-1]
-    assert last.rule == "x402.settlement"
-    assert last.decision == Decision.ALLOW.value
+    assert last.decision == RECONCILE
+    assert last.rule == "reconcile.match"
     assert last.metadata["tx_hash"] == "0xdeadbeef"
+    assert last.metadata["reconciles"] == result.call.call_id
+
+
+def test_x402_failed_settlement_is_recorded_as_a_mismatch(log):
+    """A settlement on the wrong network is an alarm, not a policy block."""
+    adapter = X402Adapter(Policy(), audit_log=log)
+    result = adapter.check_payment("/weather", 0.01, SERVER)
+
+    adapter.record_settlement(
+        result, {"success": True, "network": "base", "transaction": "0xabc"}
+    )
+
+    last = log.read_all()[-1]
+    assert last.rule == "reconcile.mismatch"
+    assert "network not allowed" in last.reason
+
+
+def test_settlement_entries_are_not_replayed_as_spend(log):
+    """A reconciliation must never move a budget.
+
+    Before reconciliation entries were excluded from replay, a settled
+    payment was counted twice by the next process to load this log.
+    """
+    policy = Policy(spend_cap=SpendCap(window_amount=1.00, currency="USDC"))
+    adapter = X402Adapter(policy, audit_log=log)
+    result = adapter.check_payment("/weather", 0.40, SERVER)
+    adapter.record_settlement(
+        result,
+        {"success": True, "network": "base-sepolia", "transaction": "0xdeadbeef"},
+    )
+
+    from guardrail_core import Guard
+
+    reloaded = Guard(policy, log)
+
+    assert reloaded.window_spend() == pytest.approx(0.40)
 
 
 def test_mpp_adapter_converts_minor_units(log):

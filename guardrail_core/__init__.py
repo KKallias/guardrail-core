@@ -15,7 +15,15 @@ decision to a tamper-evident JSONL audit log.
 
 from .audit import AuditEntry, AuditLog
 from .detectors.pii import Finding
-from .guard import BlockedByPolicy, Decision, Guard, GuardResult, ToolCall
+from .guard import (
+    BlockedByPolicy,
+    Decision,
+    Guard,
+    GuardResult,
+    ToolCall,
+    UnknownCallId,
+    compute_digest,
+)
 from .policy import Allowlist, PiiRules, Policy, PolicyError, RateLimit, SpendCap
 
 __version__ = "0.1.0"
@@ -35,5 +43,7 @@ __all__ = [
     "RateLimit",
     "SpendCap",
     "ToolCall",
+    "UnknownCallId",
     "__version__",
+    "compute_digest",
 ]

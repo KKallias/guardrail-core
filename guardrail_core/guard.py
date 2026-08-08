@@ -24,6 +24,9 @@ Every check writes exactly one audit entry, including allowed ones.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -31,7 +34,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from .audit import AuditEntry, AuditLog, utcnow
+from .audit import RECONCILE, AuditEntry, AuditLog, utcnow
 from .detectors import pii
 from .policy import Policy
 
@@ -40,6 +43,47 @@ class Decision(str, Enum):
     ALLOW = "ALLOW"
     BLOCK = "BLOCK"
     REDACT = "REDACT"
+
+
+class UnknownCallId(KeyError):
+    """Raised by `Guard.reconcile` when no decision matches the call_id.
+
+    Loud on purpose: silently accepting a reconciliation for a call that
+    was never decided would produce an audit trail that looks complete
+    while describing something the guard never saw.
+    """
+
+
+def compute_digest(call: "ToolCall") -> str:
+    """A stable sha256 over the operation a decision was made against.
+
+    Covers exactly the fields that identify *which operation* was
+    approved - tool, recipient, amount, currency, call_id, timestamp -
+    and deliberately not the payload, which redaction rewrites.
+
+    Serialization is canonical (sorted keys, no whitespace) so the same
+    call produces the same digest across processes and Python versions.
+    """
+    canonical = json.dumps(
+        {
+            "tool": call.tool,
+            "recipient": call.recipient,
+            "amount": call.amount,
+            "currency": call.currency,
+            "call_id": call.call_id,
+            "timestamp": call.timestamp.isoformat(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _amounts_differ(left: float | None, right: float | None) -> bool:
+    if left is None or right is None:
+        return left is not right
+    return not math.isclose(left, right, rel_tol=1e-9, abs_tol=1e-9)
 
 
 class BlockedByPolicy(Exception):
@@ -83,7 +127,11 @@ class ToolCall:
 
 @dataclass
 class GuardResult:
-    """The verdict for one `ToolCall`."""
+    """The verdict for one `ToolCall`.
+
+    `digest` is set for ALLOW and REDACT and is None for BLOCK - there is
+    no approved operation to bind a digest to when the call is refused.
+    """
 
     decision: Decision
     reason: str
@@ -92,6 +140,27 @@ class GuardResult:
     rule: str | None = None
     findings: list[pii.Finding] = field(default_factory=list)
     redacted_payload: Any | None = None
+    digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.digest is None and self.decision is not Decision.BLOCK:
+            self.digest = compute_digest(self.call)
+
+    def matches(self, call: ToolCall) -> bool:
+        """Does `call` still describe the operation this decision approved?
+
+        Call this immediately before executing, passing the call object
+        you are about to act on. It catches drift between `check()` and
+        execution - an amount recomputed, a recipient re-resolved, a
+        retry that rebuilt the call - where the thing being run is no
+        longer the thing that was approved.
+
+        This is a consistency check against accident, not a security
+        control: code that can change the operation can also skip this.
+        """
+        if self.digest is None:
+            return False
+        return compute_digest(call) == self.digest
 
     @property
     def allowed(self) -> bool:
@@ -144,14 +213,16 @@ class Guard:
 
     # -- history ---------------------------------------------------------
 
-    def _load_history(self) -> None:
-        """Rebuild rolling-window state from previously allowed calls.
+    #: Only these decisions represent budget actually consumed. A BLOCK
+    #: spent nothing, and a RECONCILE describes a call already counted
+    #: from its original ALLOW - replaying it would double-count the
+    #: spend on every process restart.
+    REPLAYED_DECISIONS = frozenset({Decision.ALLOW.value, Decision.REDACT.value})
 
-        Blocked calls are skipped: a refused call neither spent money nor
-        consumed the rate-limit budget.
-        """
+    def _load_history(self) -> None:
+        """Rebuild rolling-window state from previously allowed calls."""
         for entry in self.audit_log.iter_entries():
-            if entry.decision == Decision.BLOCK.value:
+            if entry.decision not in self.REPLAYED_DECISIONS:
                 continue
             self._call_events.append(entry.timestamp)
             if entry.amount:
@@ -297,6 +368,115 @@ class Guard:
 
         return GuardResult(Decision.ALLOW, "allowed by policy", call, policy_name)
 
+    # -- reconciliation ---------------------------------------------------
+
+    #: Keys in `actual` that reconcile compares against the original
+    #: decision. Everything else is recorded as metadata.
+    RECONCILE_KEYS = ("recipient", "amount", "currency")
+
+    def find_decision(self, call_id: str) -> AuditEntry | None:
+        """The original decision entry for `call_id`, or None.
+
+        Skips reconciliation entries, so reconciling twice still compares
+        against the decision rather than against the previous
+        reconciliation.
+        """
+        for entry in self.audit_log.iter_entries():
+            if entry.call_id == call_id and entry.decision != RECONCILE:
+                return entry
+        return None
+
+    def reconcile(self, call_id: str, actual: dict[str, Any]) -> None:
+        """Record what actually happened for a previously decided call.
+
+        `actual` describes the real operation after the fact. Three keys
+        are compared against the original decision - `recipient`,
+        `amount`, `currency` - and any that diverge are flagged. The
+        reserved key `ok=False` lets an adapter report a
+        protocol-level failure (a settlement that never landed, a
+        transfer the counterparty rejected) with an optional `reason`.
+        Every other key is recorded as metadata.
+
+        The result is a follow-up audit entry, never an edit: the
+        original decision line stays exactly as written. Reconciliation
+        entries are excluded from spend and rate-limit replay, so
+        recording one never moves a budget.
+
+        This is detection, not prevention. A reconciliation record cannot
+        stop a call that diverged from its decision - it makes the
+        divergence visible afterwards to anyone reading the log.
+
+        Raises
+        ------
+        UnknownCallId
+            If no decision was ever recorded for `call_id`.
+        """
+        original = self.find_decision(call_id)
+        if original is None:
+            raise UnknownCallId(
+                f"no decision recorded for call_id {call_id!r} in "
+                f"{self.audit_log.path} - nothing to reconcile against"
+            )
+
+        mismatches: list[str] = []
+
+        if "recipient" in actual and actual["recipient"] != original.recipient:
+            mismatches.append(
+                f"recipient: decided {original.recipient!r}, "
+                f"actual {actual['recipient']!r}"
+            )
+        if "amount" in actual and _amounts_differ(actual["amount"], original.amount):
+            mismatches.append(
+                f"amount: decided {original.amount!r}, actual {actual['amount']!r}"
+            )
+        if "currency" in actual and actual["currency"] != original.currency:
+            mismatches.append(
+                f"currency: decided {original.currency!r}, "
+                f"actual {actual['currency']!r}"
+            )
+        if actual.get("ok") is False:
+            mismatches.append(
+                actual.get("reason") or "caller reported the operation did not succeed"
+            )
+
+        if mismatches:
+            reason = "reconciliation mismatch - " + "; ".join(mismatches)
+            rule = "reconcile.mismatch"
+        else:
+            reason = "reconciled: actual outcome matches the decision"
+            rule = "reconcile.match"
+
+        extras = {
+            key: value
+            for key, value in actual.items()
+            if key not in self.RECONCILE_KEYS and key not in ("ok", "reason")
+        }
+
+        self.audit_log.append(
+            AuditEntry(
+                timestamp=utcnow(),
+                call_id=call_id,
+                tool=original.tool,
+                decision=RECONCILE,
+                reason=reason,
+                policy=original.policy,
+                rule=rule,
+                amount=actual.get("amount", original.amount),
+                currency=actual.get("currency", original.currency),
+                recipient=actual.get("recipient", original.recipient),
+                # The original digest, not a new one: this entry points at
+                # the decision it reconciles rather than describing a new
+                # approved operation.
+                digest=original.digest,
+                metadata={
+                    "reconciles": call_id,
+                    "original_decision": original.decision,
+                    "original_timestamp": original.timestamp.isoformat(),
+                    **extras,
+                },
+            )
+        )
+
     def record_decision(self, result: GuardResult) -> dict[str, Any]:
         """Write an audit entry for a decision made outside `check`.
 
@@ -320,6 +500,7 @@ class Guard:
             currency=call.currency
             or (self.policy.spend_cap.currency if self.policy.spend_cap else None),
             recipient=call.recipient,
+            digest=result.digest,
             findings=[f.to_dict() for f in result.findings],
             payload=result.redacted_payload,
             metadata=call.metadata,

@@ -29,6 +29,12 @@ DEFAULT_AUDIT_PATH = Path("logs") / "guardrail-audit.jsonl"
 
 SCHEMA_VERSION = 1
 
+# Decision value for a reconciliation entry - a record of what actually
+# happened, written after the fact. It is not a verdict from `Guard.check`,
+# so it must never be replayed as spend or rate-limit history; see
+# `Guard.REPLAYED_DECISIONS`.
+RECONCILE = "RECONCILE"
+
 
 @dataclass
 class AuditEntry:
@@ -49,6 +55,7 @@ class AuditEntry:
     amount: float | None = None
     currency: str | None = None
     recipient: str | None = None
+    digest: str | None = None
     findings: list[dict[str, Any]] = field(default_factory=list)
     payload: Any | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -71,6 +78,8 @@ class AuditEntry:
             entry["currency"] = self.currency
         if self.recipient is not None:
             entry["recipient"] = self.recipient
+        if self.digest is not None:
+            entry["digest"] = self.digest
         if self.findings:
             entry["findings"] = self.findings
         if self.payload is not None:
@@ -92,6 +101,7 @@ class AuditEntry:
             amount=data.get("amount"),
             currency=data.get("currency"),
             recipient=data.get("recipient"),
+            digest=data.get("digest"),
             findings=data.get("findings", []),
             payload=data.get("redacted_payload"),
             metadata=data.get("metadata", {}),
