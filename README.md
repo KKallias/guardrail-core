@@ -53,6 +53,34 @@ python examples/unified_demo.py --step   # pause between sections
 Requires Python 3.10+. Runtime dependency: `pyyaml`. The LangChain adapter
 is optional — it imports and works without LangChain installed.
 
+## Claude Code / Claude Agent SDK
+
+```bash
+pip install -e .
+```
+
+```json
+// .claude/hooks.json
+{
+  "hooks": {
+    "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "python3 -m guardrail_core.adapters.claude_code"}]}],
+    "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "python3 -m guardrail_core.adapters.claude_code"}]}]
+  }
+}
+```
+
+Every tool call — built-in (`Bash`, `WebFetch`, ...) or MCP — is now
+evaluated against `guardrails/policy.yaml` before it runs. See
+[`examples/claude-code-plugin/`](examples/claude-code-plugin/) for a
+working policy and a walkthrough.
+
+Two pieces go further than tool-call-level policy:
+
+- **`guardrail_core.credentials`** mints short-lived, scoped, limited-use credentials instead of handing the agent one long-lived API key. The model never sees the real secret.
+- **`guardrail_core.egress`** runs a local HTTP/HTTPS forward proxy that enforces a network allowlist independent of which tool made the request — point `HTTP_PROXY`/`HTTPS_PROXY` at it.
+
+Neither is a sandbox. See each module's docstring for exactly what it does and does not cover.
+
 ## The model
 
 Everything funnels through one call:
