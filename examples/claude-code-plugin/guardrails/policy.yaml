@@ -1,0 +1,45 @@
+# Example policy for the Claude Code hook adapter.
+#
+# Copy this to <project>/guardrails/policy.yaml (or point GUARDRAIL_POLICY
+# at wherever you keep it) and adjust the allowlist / limits for your
+# project. See ../../../guardrail_core/policy.py for every field.
+
+name: default
+
+# Every network-reaching tool call gets a `recipient`:
+#   - WebFetch                -> the URL's hostname
+#   - mcp__<server>__<tool>   -> the MCP server name
+#   - Bash curl/wget/gh/aws/… -> the URL's hostname in the command
+# Tools with no discoverable network target (Read, Edit, a Bash command
+# with no recognized network verb) skip this rule entirely. See
+# guardrail_core/adapters/claude_code.py's module docstring for what
+# this can and cannot see -- pair it with the egress proxy for a
+# tool-agnostic boundary.
+allowlist:
+  recipients:
+    - api.anthropic.com
+    - github.com
+    - api.github.com
+    - pypi.org
+    - registry.npmjs.org
+    # - your-internal-mcp-server-name
+
+# Claude Code does not expose a real dollar cost per tool call, so a
+# spend_cap here only does something if you pass `amount_for=` to
+# ClaudeCodeGuard with your own per-tool price estimate. Left in as a
+# template; delete it if you are only using rate_limit + allowlist.
+spend_cap:
+  per_call: 1.00
+  window_amount: 10.00
+  window_seconds: 3600
+  currency: USD
+
+# A hard ceiling on tool calls per session regardless of price -- this
+# is the one that actually fires out of the box, with no amount_for.
+rate_limit:
+  max_calls: 200
+  window_seconds: 3600
+
+pii_rules:
+  detectors: [email, api_key, crypto_wallet, card_number]
+  action: redact
