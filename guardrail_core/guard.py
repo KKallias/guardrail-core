@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -190,13 +191,36 @@ class GuardResult:
         return self
 
 
+#: Default hold time for an unconfirmed reservation before `reserve`
+#: sweeps and releases it automatically. Long enough for a slow
+#: settlement, short enough that an abandoned call does not tie up
+#: budget indefinitely.
+DEFAULT_RESERVATION_TTL = 300.0
+
+
+@dataclass
+class _Reservation:
+    """An open, unconfirmed hold on budget and rate-limit, taken by
+    `Guard.reserve` and resolved by `Guard.finalize` or `Guard.release`
+    (including the automatic release of a reservation past its TTL).
+    """
+
+    call: ToolCall
+    result: GuardResult
+    expires_at: datetime
+    spend_event: tuple[datetime, float] | None
+    call_event: datetime | None
+
+
 class Guard:
     """Evaluates tool-calls against a `Policy` and records every decision.
 
     Spend and rate-limit state is rolling-window based and is rebuilt
     from the audit log on construction, so limits survive process
     restarts (an agent script that runs once per cron tick still shares
-    one budget).
+    one budget). Any reservation still open (see `reserve`) when the log
+    was last written is rebuilt too, so it can still expire or be
+    released after a restart.
     """
 
     def __init__(
@@ -216,6 +240,18 @@ class Guard:
         self._spend_events: list[tuple[datetime, float]] = []
         self._call_events: list[datetime] = []
 
+        # Guards every read and mutation of the two lists above, plus
+        # `_reservations`, so `check`/`reserve`/`commit`/`finalize`/
+        # `release` are each atomic even under concurrent threads. RLock
+        # because `check` and `reserve` call other locking methods
+        # (`commit`, `_release_locked`) on the same thread while already
+        # holding it.
+        self._lock = threading.RLock()
+
+        # Open reservations taken by `reserve`, keyed by call_id, not yet
+        # resolved by `finalize` or `release`.
+        self._reservations: dict[str, _Reservation] = {}
+
         if load_history:
             self._load_history()
 
@@ -227,34 +263,95 @@ class Guard:
     #: spend on every process restart.
     REPLAYED_DECISIONS = frozenset({Decision.ALLOW.value, Decision.REDACT.value})
 
+    #: Rules written to the log by `release`/`_sweep_expired` for a
+    #: reservation that was given back. A call_id marked with either
+    #: never actually held its budget, so history replay must skip it.
+    _RESERVATION_GIVEN_BACK = frozenset({"reservation.released", "reservation.expired"})
+
     def _load_history(self) -> None:
-        """Rebuild rolling-window state from previously allowed calls."""
-        for entry in self.audit_log.iter_entries():
+        """Rebuild rolling-window state, and any still-open reservations,
+        from the audit log.
+
+        Two passes: the first finds which call_ids had a reservation
+        that was later released/expired (skip their spend entirely) or
+        finalized (spend stays, but it is no longer an open reservation);
+        the second replays spend/rate history and re-opens whatever
+        reservation is still pending, exactly as `reserve` left it.
+        """
+        entries = list(self.audit_log.iter_entries())
+
+        given_back: set[str] = set()
+        finalized: set[str] = set()
+        for entry in entries:
+            if entry.decision != RECONCILE:
+                continue
+            if entry.rule in self._RESERVATION_GIVEN_BACK:
+                given_back.add(entry.call_id)
+            elif entry.rule == "reservation.finalized":
+                finalized.add(entry.call_id)
+
+        for entry in entries:
             if entry.decision not in self.REPLAYED_DECISIONS:
                 continue
+            if entry.call_id in given_back:
+                continue  # released or expired - never actually spent
+
             self._call_events.append(entry.timestamp)
+            spend_event = None
             if entry.amount:
-                self._spend_events.append((entry.timestamp, entry.amount))
+                spend_event = (entry.timestamp, entry.amount)
+                self._spend_events.append(spend_event)
+
+            if entry.metadata.get("phase") == "reserved" and entry.call_id not in finalized:
+                # Still open when the log was last written - rebuild the
+                # reservation so it can still be finalized, released, or
+                # swept once its TTL has passed.
+                call = ToolCall(
+                    tool=entry.tool,
+                    amount=entry.amount,
+                    currency=entry.currency,
+                    recipient=entry.recipient,
+                    call_id=entry.call_id,
+                    timestamp=entry.timestamp,
+                )
+                result = GuardResult(
+                    decision=Decision(entry.decision),
+                    reason=entry.reason,
+                    call=call,
+                    policy=entry.policy,
+                    rule=entry.rule,
+                    digest=entry.digest,
+                )
+                ttl = entry.metadata.get("ttl_seconds", DEFAULT_RESERVATION_TTL)
+                self._reservations[entry.call_id] = _Reservation(
+                    call=call,
+                    result=result,
+                    expires_at=entry.timestamp + timedelta(seconds=ttl),
+                    spend_event=spend_event,
+                    call_event=entry.timestamp,
+                )
 
     # -- introspection ---------------------------------------------------
 
     def window_spend(self, now: datetime | None = None) -> float:
         """Total committed spend inside the spend cap's rolling window."""
-        cap = self.policy.spend_cap
-        if cap is None or cap.window_amount is None:
-            return sum(amount for _, amount in self._spend_events)
-        now = now or utcnow()
-        start = now - timedelta(seconds=cap.window_seconds)
-        return sum(amount for ts, amount in self._spend_events if ts >= start)
+        with self._lock:
+            cap = self.policy.spend_cap
+            if cap is None or cap.window_amount is None:
+                return sum(amount for _, amount in self._spend_events)
+            now = now or utcnow()
+            start = now - timedelta(seconds=cap.window_seconds)
+            return sum(amount for ts, amount in self._spend_events if ts >= start)
 
     def window_calls(self, now: datetime | None = None) -> int:
         """Number of committed calls inside the rate limit's window."""
-        limit = self.policy.rate_limit
-        if limit is None:
-            return len(self._call_events)
-        now = now or utcnow()
-        start = now - timedelta(seconds=limit.window_seconds)
-        return sum(1 for ts in self._call_events if ts >= start)
+        with self._lock:
+            limit = self.policy.rate_limit
+            if limit is None:
+                return len(self._call_events)
+            now = now or utcnow()
+            start = now - timedelta(seconds=limit.window_seconds)
+            return sum(1 for ts in self._call_events if ts >= start)
 
     def remaining_budget(self, now: datetime | None = None) -> float | None:
         cap = self.policy.spend_cap
@@ -270,21 +367,230 @@ class Guard:
         With `commit=True` (the default) an allowed call immediately
         consumes its spend and rate-limit budget, which is what a
         wrapper that is about to execute the call wants. Pass
-        `commit=False` for a dry run - a pre-flight "would this be
-        allowed?" - and call `Guard.commit(call)` yourself once the call
-        actually happens.
+        `commit=False` for a dry run - a pure "would this be allowed?"
+        with no side effects at all, not even a hold - and call
+        `Guard.commit(call)` yourself once the call actually happens.
+
+        `commit=False` does not reserve anything: two concurrent dry
+        runs can both evaluate against the same unspent budget and then
+        both go on to commit. For any flow where the call site decides
+        now but pays later - the classic "check, then sign and send,
+        then settle" shape - use `reserve`/`finalize`/`release` instead,
+        which hold the budget atomically between the two.
         """
-        result = self._evaluate(call)
-        self._write_audit(result)
-        if commit and result.allowed:
-            self.commit(call)
+        with self._lock:
+            result = self._evaluate(call)
+            self._write_audit(result)
+            if commit and result.allowed:
+                self.commit(call)
         return result
 
     def commit(self, call: ToolCall) -> None:
         """Record that `call` actually consumed budget."""
-        self._call_events.append(call.timestamp)
-        if call.amount:
-            self._spend_events.append((call.timestamp, call.amount))
+        with self._lock:
+            self._call_events.append(call.timestamp)
+            if call.amount:
+                self._spend_events.append((call.timestamp, call.amount))
+
+    # -- two-phase reservations --------------------------------------------
+
+    def reserve(self, call: ToolCall, *, ttl_seconds: float = DEFAULT_RESERVATION_TTL) -> GuardResult:
+        """Atomically evaluate `call` and, if allowed, hold its budget
+        and rate-limit slot until `finalize`, `release`, or expiry.
+
+        This is the concurrency-safe replacement for the
+        `check(commit=False)` + manual `commit()` split: that pattern
+        evaluates without holding anything, so two calls racing for the
+        same remaining budget can both pass the check and then both
+        spend it. `reserve` closes that gap - the evaluation and the
+        hold happen together under one lock, so a second `reserve`
+        racing for the last unit of budget sees the first reservation
+        already counted.
+
+        Typical use (the x402/MPP "quote now, pay later" shape)::
+
+            result = guard.reserve(call)
+            if result.blocked:
+                return  # never signs, never sends
+            settlement = do_the_actual_payment(result.payload)
+            if settlement.ok and result.matches(actual_call(settlement)):
+                guard.finalize(call.call_id)
+                guard.reconcile(call.call_id, {...})
+            else:
+                guard.release(call.call_id, reason="settlement mismatch or failure")
+
+        A BLOCK result holds nothing, exactly like `check`. An ALLOW or
+        REDACT result holds its budget until resolved; a reservation
+        left unresolved for `ttl_seconds` is swept and released the next
+        time `reserve` runs, logged as `reservation.expired`.
+
+        `call.call_id` is a one-shot idempotency key. Calling `reserve`
+        again with a call_id that already has *any* decision on record -
+        pending, finalized, released, or expired - never reserves a
+        second time: it is logged as `reservation.duplicate_call_id` and
+        the original decision is returned unchanged, so a duplicate call
+        (a retry that reused the same id instead of minting a new one)
+        produces exactly one debit, not two. A genuine retry after a
+        release or an expiry must use a new call_id.
+        """
+        with self._lock:
+            self._sweep_expired(call.timestamp)
+
+            existing = self.find_decision(call.call_id)
+            if existing is not None:
+                self.audit_log.append(
+                    AuditEntry(
+                        timestamp=utcnow(),
+                        call_id=call.call_id,
+                        tool=existing.tool,
+                        decision=RECONCILE,
+                        reason=(
+                            f"duplicate call_id: a decision was already recorded for "
+                            f"{call.call_id!r}, not reserving again"
+                        ),
+                        policy=existing.policy,
+                        rule="reservation.duplicate_call_id",
+                        amount=existing.amount,
+                        currency=existing.currency,
+                        recipient=existing.recipient,
+                        digest=existing.digest,
+                        metadata={"reconciles": call.call_id, "phase": "duplicate"},
+                    )
+                )
+                return GuardResult(
+                    decision=Decision(existing.decision),
+                    reason=existing.reason,
+                    call=call,
+                    policy=existing.policy,
+                    rule=existing.rule,
+                    digest=existing.digest,
+                )
+
+            result = self._evaluate(call)
+            self._write_audit(
+                result, extra_metadata={"phase": "reserved", "ttl_seconds": ttl_seconds}
+            )
+
+            if result.allowed:
+                spend_event = None
+                if call.amount:
+                    spend_event = (call.timestamp, call.amount)
+                    self._spend_events.append(spend_event)
+                call_event = call.timestamp
+                self._call_events.append(call_event)
+                self._reservations[call.call_id] = _Reservation(
+                    call=call,
+                    result=result,
+                    expires_at=call.timestamp + timedelta(seconds=ttl_seconds),
+                    spend_event=spend_event,
+                    call_event=call_event,
+                )
+            return result
+
+    def finalize(self, call_id: str) -> None:
+        """Confirm a reservation actually happened.
+
+        The budget was already held at `reserve` time; `finalize` only
+        stops it from expiring and records the confirmation as
+        `reservation.finalized`. Call `reconcile` separately (before or
+        after) to record what the settlement actually was - `finalize`
+        says "the call went ahead", `reconcile` says "and here is what
+        it actually did".
+
+        Raises `UnknownCallId` if `call_id` has no open reservation -
+        already finalized, released, expired, or never reserved at all.
+        """
+        with self._lock:
+            reservation = self._reservations.pop(call_id, None)
+            if reservation is None:
+                raise UnknownCallId(
+                    f"no open reservation for call_id {call_id!r} in "
+                    f"{self.audit_log.path} - nothing to finalize"
+                )
+            self.audit_log.append(
+                AuditEntry(
+                    timestamp=utcnow(),
+                    call_id=call_id,
+                    tool=reservation.call.tool,
+                    decision=RECONCILE,
+                    reason="reservation finalized: call executed as approved",
+                    policy=reservation.result.policy,
+                    rule="reservation.finalized",
+                    amount=reservation.call.amount,
+                    currency=reservation.call.currency,
+                    recipient=reservation.call.recipient,
+                    digest=reservation.result.digest,
+                    metadata={"reconciles": call_id, "phase": "finalized"},
+                )
+            )
+
+    def release(self, call_id: str, *, reason: str = "reservation released") -> None:
+        """Give back a reservation's held budget and rate-limit slot.
+
+        Use this on a definite failure - the payment errored, the
+        counterparty rejected it, the challenge changed after preflight
+        and the call site decided not to proceed. Raises `UnknownCallId`
+        if `call_id` has no open reservation, the same loud-on-purpose
+        behaviour as `reconcile` and `finalize`.
+        """
+        with self._lock:
+            self._release_locked(call_id, reason=reason, rule="reservation.released")
+
+    def _release_locked(self, call_id: str, *, reason: str, rule: str) -> None:
+        """`release`'s body, callable while `self._lock` is already held
+        (by `release` itself, or by `_sweep_expired` from inside `reserve`).
+        """
+        reservation = self._reservations.pop(call_id, None)
+        if reservation is None:
+            raise UnknownCallId(
+                f"no open reservation for call_id {call_id!r} in "
+                f"{self.audit_log.path} - nothing to release"
+            )
+        if reservation.spend_event is not None:
+            try:
+                self._spend_events.remove(reservation.spend_event)
+            except ValueError:
+                pass  # already gone somehow; releasing is still safe
+        if reservation.call_event is not None:
+            try:
+                self._call_events.remove(reservation.call_event)
+            except ValueError:
+                pass
+        self.audit_log.append(
+            AuditEntry(
+                timestamp=utcnow(),
+                call_id=call_id,
+                tool=reservation.call.tool,
+                decision=RECONCILE,
+                reason=reason,
+                policy=reservation.result.policy,
+                rule=rule,
+                amount=reservation.call.amount,
+                currency=reservation.call.currency,
+                recipient=reservation.call.recipient,
+                digest=reservation.result.digest,
+                metadata={"reconciles": call_id, "phase": "released"},
+            )
+        )
+
+    def _sweep_expired(self, now: datetime) -> None:
+        """Release every reservation whose TTL has passed as of `now`.
+
+        Called at the top of `reserve`, under the lock, so an abandoned
+        reservation's budget comes back before it can block a later
+        call that would otherwise fit.
+        """
+        expired_ids = [
+            call_id
+            for call_id, reservation in self._reservations.items()
+            if reservation.expires_at <= now
+        ]
+        for call_id in expired_ids:
+            self._release_locked(
+                call_id,
+                reason=f"reservation expired unconfirmed as of {now.isoformat()}",
+                rule="reservation.expired",
+            )
 
     def _evaluate(self, call: ToolCall) -> GuardResult:
         now = call.timestamp
@@ -494,8 +800,13 @@ class Guard:
         """
         return self._write_audit(result)
 
-    def _write_audit(self, result: GuardResult) -> dict[str, Any]:
+    def _write_audit(
+        self, result: GuardResult, *, extra_metadata: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         call = result.call
+        metadata = dict(call.metadata)
+        if extra_metadata:
+            metadata.update(extra_metadata)
         entry = AuditEntry(
             timestamp=call.timestamp,
             call_id=call.call_id,
@@ -511,6 +822,6 @@ class Guard:
             digest=result.digest,
             findings=[f.to_dict() for f in result.findings],
             payload=result.redacted_payload,
-            metadata=call.metadata,
+            metadata=metadata,
         )
         return self.audit_log.append(entry)
