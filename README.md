@@ -2,6 +2,7 @@
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![tests](https://github.com/KKallias/guardrail-core/actions/workflows/tests.yml/badge.svg)](https://github.com/KKallias/guardrail-core/actions/workflows/tests.yml)
 
 ![guardrail-core demo](assets/demo.gif)
 
@@ -471,7 +472,7 @@ succeed, the fifth is blocked, then the audit log is printed.
 python -m pytest
 ```
 
-163 tests, no network access, no live services — allowlist blocks, spend-cap
+Fully offline (no network access, no live services); covers allowlist blocks, spend-cap
 blocks, rate-limit blocks, PII redaction, allowed pass-through, adapter
 behaviour, audit-log durability, and CLI exit codes.
 
